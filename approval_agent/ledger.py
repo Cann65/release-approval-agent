@@ -109,7 +109,12 @@ class Ledger:
             if state != "approved":
                 return review, False
             scope = review["scope"]
-            blockers = policy(review["evidence"], self.clock())
+            evidence = review["evidence"]
+            if (scope["artifact"] != evidence["artifact"]["digest"]
+                    or scope["evidence_sha"] != digest(evidence) or review_id != digest(scope)):
+                blockers = [{"reason": "evidence differs from the immutable review", "source": "evidence"}]
+            else:
+                blockers = policy(evidence, self.clock())
             if not self.can_approve(db, review["approver"], scope["environment"]):
                 blockers.append({"reason": "approver currently lacks the staging role", "source": "roles"})
             if blockers:
@@ -145,8 +150,8 @@ class Ledger:
                                   "deployment_unconfirmed", {"operation": operation, "scope": scope})
             return self.read(db, review_id)
 
-    def dispatch(self, review_id, target):
-        review, claimed = self.claim(review_id)
+    def dispatch(self, review_id, target, *, reconcile_only=False):
+        review, claimed = (self.get(review_id), False) if reconcile_only else self.claim(review_id)
         if review["state"] not in ("dispatching", "unknown"):
             return review
         try:

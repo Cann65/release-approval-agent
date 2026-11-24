@@ -6,7 +6,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 
+from approval_agent.authorization import DeploymentAuthorization
 from approval_agent.demo import DemoRuntime, DropReply, run, specimen
 from approval_agent.evaluate import evaluate
 from approval_agent.ledger import Ledger
@@ -36,6 +38,7 @@ class ApprovalTests(unittest.TestCase):
         self.revision = "c" * 40
         self.runtime = CountingRuntime()
         self.target = Target(self.root / "target.db", self.repository, self.runtime)
+        self.authorization = DeploymentAuthorization(b"s" * 32, clock=lambda: self.now.timestamp())
 
     def evidence(self, tests=True):
         return {
@@ -93,6 +96,16 @@ class ApprovalTests(unittest.TestCase):
         self.ledger.approve(review["id"], "alice", self.image)
         self.assertEqual(self.ledger.dispatch(review["id"], self.target)["state"], "blocked")
 
+    def test_changed_evidence_is_blocked_before_dispatch(self):
+        evidence = self.evidence(False)
+        review = self.ledger.review(evidence, rules_advisor)
+        self.ledger.approve(review["id"], "alice", self.image)
+        with self.ledger.transaction() as db:
+            db.execute("UPDATE reviews SET evidence=? WHERE id=?", (json.dumps(self.evidence()), review["id"]))
+        blocked = self.ledger.dispatch(review["id"], self.target)
+        self.assertEqual(blocked["result"]["blockers"][0]["source"], "evidence")
+        self.assertEqual(self.runtime.starts, 0)
+
     def test_current_role_is_checked_after_approval_and_audited(self):
         review = self.ledger.review(self.evidence(), rules_advisor)
         self.ledger.approve(review["id"], "alice", self.image)
@@ -113,18 +126,56 @@ class ApprovalTests(unittest.TestCase):
         self.assertEqual(blocked["result"]["blockers"][0]["source"], "monitoring")
 
     def test_response_loss_reconciles_over_http_after_restart(self):
-        endpoint = self.server(serve(self.target, "synthetic-token"))
-        client = Client(endpoint, "synthetic-token")
+        endpoint = self.server(serve(self.target, "synthetic-token", authorization=self.authorization))
+        client = Client(endpoint, "synthetic-token", authorization=self.authorization)
+        status = Client(endpoint, "synthetic-token")
         review = self.ledger.review(self.evidence(), rules_advisor)
         self.ledger.approve(review["id"], "alice", self.image)
         pending = self.ledger.dispatch(review["id"], DropReply(client))
         self.assertEqual(pending["state"], "unknown")
         restored = Ledger(self.ledger.database, lambda: self.now)
-        final = restored.dispatch(review["id"], client)
+        self.now += timedelta(minutes=2)
+        final = restored.dispatch(review["id"], status, reconcile_only=True)
         self.assertEqual(final["state"], "deployed")
         self.assertEqual(pending["operation"], final["operation"])
         self.assertEqual(restored.dispatch(review["id"], client)["state"], "deployed")
         self.assertEqual(self.runtime.starts, 1)
+
+    def test_status_token_alone_cannot_start_a_deployment(self):
+        endpoint = self.server(serve(self.target, "synthetic-token", authorization=self.authorization))
+        client = Client(endpoint, "synthetic-token")
+        review = self.ledger.review(self.evidence(), rules_advisor)
+        scope = review["scope"]
+        with self.assertRaises(HTTPError) as response:
+            client.request(operation_id(scope), "PUT", {"scope": scope})
+        self.assertEqual(response.exception.code, 403)
+        self.assertIsNone(self.target.lookup(operation_id(scope)))
+        self.assertEqual(self.runtime.starts, 0)
+
+    def test_target_rejects_changed_or_expired_authorizations(self):
+        endpoint = self.server(serve(self.target, "synthetic-token", authorization=self.authorization))
+        client = Client(endpoint, "synthetic-token", authorization=self.authorization)
+        scope = self.ledger.review(self.evidence(), rules_advisor)["scope"]
+        operation = operation_id(scope)
+        authorization = self.authorization.issue(operation, scope)
+        changed = {**scope, "artifact": self.other_image}
+        with self.assertRaises(HTTPError) as mismatch:
+            client.request(operation_id(changed), "PUT", {"scope": changed, "authorization": authorization})
+        self.assertEqual(mismatch.exception.code, 403)
+        self.now += timedelta(seconds=60)
+        with self.assertRaises(HTTPError) as expired:
+            client.request(operation, "PUT", {"scope": scope, "authorization": authorization})
+        self.assertEqual(expired.exception.code, 403)
+        self.assertEqual(self.runtime.starts, 0)
+        self.assertEqual(client.apply(operation, scope)["state"], "applied")
+
+    def test_reconciliation_does_not_claim_an_approved_release(self):
+        review = self.ledger.review(self.evidence(), rules_advisor)
+        self.ledger.approve(review["id"], "alice", self.image)
+        result = self.ledger.dispatch(review["id"], self.target, reconcile_only=True)
+        self.assertEqual(result["state"], "approved")
+        self.assertIsNone(result["operation"])
+        self.assertEqual(self.runtime.starts, 0)
 
     def test_concurrent_dispatch_and_target_retries_start_one_container(self):
         review = self.ledger.review(self.evidence(), rules_advisor)
@@ -168,6 +219,7 @@ class ApprovalTests(unittest.TestCase):
         self.assertEqual(report["deployed"]["observed_version"], "42")
         self.assertNotEqual(report["tag_after_approval"], report["deployed"]["scope"]["artifact"])
         self.assertEqual(report["deployed"]["states"], ["unknown", "deployed"])
+        self.assertEqual(report["authorization"]["status_token_write_http_status"], 403)
         result = evaluate(rules_advisor)
         self.assertEqual(result["correct_decisions"], 7)
         self.assertEqual(result["correct_sources"], 7)

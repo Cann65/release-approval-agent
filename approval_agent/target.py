@@ -9,7 +9,7 @@ from hmac import compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import monotonic, sleep
 from urllib.parse import urlsplit
-from urllib.request import Request, build_opener, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from .review import ARTIFACT, NoRedirect, canonical, operation_id
 
@@ -38,7 +38,7 @@ class DockerRuntime:
             return None
         url = f"http://127.0.0.1:{int(port)}/version"
         try:
-            with urlopen(url, timeout=1) as response:
+            with build_opener(ProxyHandler({}), NoRedirect()).open(url, timeout=1) as response:
                 if response.status != 200:
                     return None
         except OSError:
@@ -122,29 +122,35 @@ class Target:
 
 
 class Client:
-    def __init__(self, endpoint, token):
+    def __init__(self, endpoint, token, *, authorization=None):
         url = urlsplit(endpoint)
         if (url.scheme != "http" or url.hostname != "127.0.0.1" or url.port is None
                 or url.username is not None or url.path not in ("", "/") or url.query or url.fragment):
             raise ValueError("the demo staging control plane must use a loopback URL and port")
         self.endpoint = endpoint.rstrip("/")
         self.token = token
+        self.authorization = authorization
 
     def apply(self, operation, scope):
-        return self.request(operation, "PUT", scope)
+        if self.authorization is None:
+            raise PermissionError("deployment requires a signing key")
+        return self.request(operation, "PUT", {
+            "scope": scope,
+            "authorization": self.authorization.issue(operation, scope),
+        })
 
     def lookup(self, operation):
         return self.request(operation, "GET")
 
-    def request(self, operation, method, scope=None):
-        body = canonical(scope).encode() if scope is not None else None
+    def request(self, operation, method, payload=None):
+        body = canonical(payload).encode() if payload is not None else None
         request = Request(self.endpoint + "/operations/" + operation, data=body, method=method,
                           headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
-        with build_opener(NoRedirect()).open(request, timeout=55) as response:
+        with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=60) as response:
             return json.load(response)
 
 
-def serve(target, token, host="127.0.0.1", port=0):
+def serve(target, token, *, authorization, host="127.0.0.1", port=0):
     if not token or host != "127.0.0.1":
         raise ValueError("the demo requires a bearer token and loopback binding")
 
@@ -164,7 +170,11 @@ def serve(target, token, host="127.0.0.1", port=0):
                     length = int(self.headers.get("Content-Length", "0"))
                     if not 1 <= length <= 4096:
                         raise ValueError("invalid request size")
-                    result = target.apply(operation, json.loads(self.rfile.read(length)))
+                    request = json.loads(self.rfile.read(length))
+                    if (not isinstance(request, dict) or set(request) != {"scope", "authorization"}
+                            or not authorization.accepts(operation, request["scope"], request["authorization"])):
+                        return self.reply(403, {"error": "valid deployment authorization required"})
+                    result = target.apply(operation, request["scope"])
                 else:
                     result = target.lookup(operation)
             except (ValueError, TypeError, RecursionError):

@@ -13,8 +13,10 @@ import tempfile
 import threading
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from .authorization import DeploymentAuthorization
 from .ledger import Ledger
 from .review import collect, operation_id, rules_advisor, utc_now
 from .target import Client, DockerRuntime, Target, serve
@@ -51,7 +53,8 @@ def command(*args):
 
 def specimen(directory):
     repo = directory / "test-repository"
-    shutil.copytree(Path(__file__).resolve().parents[1] / "example_service", repo)
+    shutil.copytree(Path(__file__).resolve().parents[1] / "example_service", repo,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     command("git", "-C", str(repo), "init", "-q", "--object-format=sha1")
     commits = []
     for version in (41, 42, 43):
@@ -66,14 +69,18 @@ def specimen(directory):
 @contextmanager
 def staging(directory, live):
     token = secrets.token_urlsafe(32)
+    signing_key = secrets.token_hex(32)
+    authorization = DeploymentAuthorization.from_hex(signing_key)
     if not live:
         repository = "demo.invalid/checkout"
         runtime = DemoRuntime()
-        with serve(Target(directory / "target.db", repository, runtime), token) as server:
+        with serve(Target(directory / "target.db", repository, runtime), token,
+                   authorization=authorization) as server:
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                yield repository, Client(f"http://127.0.0.1:{server.server_port}", token), runtime
+                yield repository, Client(f"http://127.0.0.1:{server.server_port}", token,
+                                         authorization=authorization), runtime
             finally:
                 server.shutdown()
                 thread.join()
@@ -86,7 +93,7 @@ def staging(directory, live):
         cleanup.callback(command, "docker", "rm", "-f", registry)
         port = command("docker", "port", registry, "5000/tcp").split(":")[-1]
         repository = f"127.0.0.1:{port}/portfolio/checkout"
-        env = {**os.environ, "STAGING_TARGET_TOKEN": token}
+        env = {**os.environ, "STAGING_TARGET_TOKEN": token, "STAGING_SIGNING_KEY": signing_key}
         target_process = subprocess.Popen(
             [sys.executable, "-m", "approval_agent", "--db", str(directory / "target.db"),
              "target", "--repository", repository, "--port", "0"],
@@ -97,7 +104,7 @@ def staging(directory, live):
         endpoint = target_process.stdout.readline().strip()
         if not endpoint.startswith("http://127.0.0.1:"):
             raise RuntimeError("staging control plane failed to start")
-        yield repository, Client(endpoint, token), DockerRuntime()
+        yield repository, Client(endpoint, token, authorization=authorization), DockerRuntime()
 
 
 def build_artifact(repo, revision, version, repository, live):
@@ -149,14 +156,24 @@ def run(directory, live=False, interactive=False):
         artifact_43, checks_43 = build_artifact(repo, version_43, 43, repository, live)
         assert artifact_42 != artifact_43
 
+        status_client = Client(client.endpoint, client.token)
+        operation = operation_id(ready["scope"])
+        try:
+            status_client.request(operation, "PUT", {"scope": ready["scope"]})
+        except HTTPError as exc:
+            if exc.code != 403:
+                raise
+        else:
+            raise AssertionError("staging accepted a deployment without signed authorization")
+
         if live:
             cleanup.callback(
-                subprocess.run, ["docker", "rm", "-f", runtime.name(operation_id(ready["scope"]))],
+                subprocess.run, ["docker", "rm", "-f", runtime.name(operation)],
                 capture_output=True, timeout=15,
             )
         error = ledger.dispatch(ready["id"], DropReply(client))
         assert error["state"] == "unknown"
-        confirmed = ledger.dispatch(ready["id"], client)
+        confirmed = ledger.dispatch(ready["id"], status_client, reconcile_only=True)
         assert confirmed["state"] == "deployed" and confirmed["scope"]["artifact"] == artifact_42
         deployment = confirmed["result"]["deployment"]
         observed = "42"
@@ -184,6 +201,7 @@ def run(directory, live=False, interactive=False):
     return {
         "registry_mode": "local Docker registry" if live else "synthetic image digests",
         "tag_after_approval": artifact_43,
+        "authorization": {"status_token_write_http_status": 403},
         "deployed": {"scope": confirmed["scope"], "observed_version": observed,
                      "states": [error["state"], confirmed["state"]], "audit": ledger.audit(ready["id"])},
         "missing_tests": {"recommendation": flawed["recommendation"], **invalid_dispatch["result"],
